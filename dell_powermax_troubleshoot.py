@@ -18,14 +18,16 @@ PORTS = "your_port"  # Unisphere REST port, typically 8443. A single port or sev
 VERIFY_SSL = False
 SCHEME = "https"
 TIMEOUT = 20
-API_VERSION = "103"  # Unisphere 10.3.x REST version segment - matches the customer's 10.3.0.0 environment
+API_VERSION = "103"  # last-resort fallback only, used if GET /version can't be reached/parsed at all
 MAX_RECORDS = 10  # cap on records shown per endpoint (display trimming of raw list responses)
 MAX_DEPENDENT_CALLS = 5  # cap on how many ids a list -> detail dependent call will try/take
 MAX_PRINT = 500_000
 
 # PowerMax/Unisphere REST uses plain HTTP Basic Auth on every call - confirmed from Dell's own shipping
 # PyU4V client (rest_requests.py): no login/logout call, no session cookie, no CSRF token, unlike Unity XT.
-HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
+# Content-Type is added per-call in call() only for methods that actually carry a body (POST) - the
+# official doc's GET header table does not list Content-Type at all.
+HEADERS = {"Accept": "application/json"}
 SECRET_HEADERS = ("authorization",)
 SUMMARY = []
 CALLS = [0]
@@ -82,6 +84,8 @@ def trim_lists(obj, cap):
 def call(opener, base, path, method="GET", basic=None, body=None, show_body=True):
     """Send one request, write its details to the log and return dict(status, headers, body, json, error)."""
     hdrs = dict(HEADERS)
+    if method == "POST":
+        hdrs["Content-Type"] = "application/json"
     if basic:
         hdrs["Authorization"] = "Basic " + base64.b64encode(("%s:%s" % basic).encode("utf-8")).decode("ascii")
     data = b"" if method == "POST" else None
@@ -223,16 +227,48 @@ def pmax_call(opener, base, creds, res, path, method="GET", body=None, label=Non
     return r
 
 
+def vpath(template, *args):
+    """Build a `version -> path` function from a template whose first %s is the version segment,
+    e.g. vpath("/%s/system/symmetrix/%s/health", array_id) -> lambda v: "/<v>/system/symmetrix/<array_id>/health".
+    Used so every versioned call site can be tried against each API version PowerMax reports as supported."""
+    return lambda v: template % ((v,) + args)
+
+
+def versioned_call(opener, base, creds, res, build_path, method="GET", body=None, label=None, show_body=True):
+    """Try build_path(v) for each API version Unisphere reported as supported (newest first, from
+    discover_api_versions), stopping at the first HTTP 200. Counts/reports the endpoint once either way,
+    not once per version probed, so trying 3 versions doesn't look like 3 failed endpoints in the summary."""
+    versions = res.get("api_versions") or [API_VERSION]
+    tried = []
+    r = None
+    for v in versions:
+        r = call(opener, base, q(build_path(v)), method=method, basic=creds, body=body, show_body=show_body)
+        tried.append(v)
+        if r["status"] == 200:
+            r["version_used"] = v
+            r["versions_tried"] = tried
+            res["endpoints_total"] += 1
+            return r
+        if r["status"] is None:
+            break  # connection/timeout-level failure - same for every version, no point retrying the others
+    r["versions_tried"] = tried
+    res["endpoints_total"] += 1
+    r["version_used"] = None
+    res["endpoints_failed"].append(label or build_path(versions[0]))
+    return r
+
+
 def first_working(opener, base, creds, res, ids, path_fn, label):
     """Array-id discovery only: try each id in turn and stop at the first one that actually has data -
     here we just need one working array to operate on, not a sample of records."""
     last = None
     for _id in ids[:MAX_DEPENDENT_CALLS]:
-        path = path_fn(_id)
-        r = pmax_call(opener, base, creds, res, path, label="%s (id=%s)" % (label, _id))
+        build_path = path_fn(_id)
+        r = versioned_call(opener, base, creds, res, build_path, label="%s (id=%s)" % (label, _id))
         has_data = r["status"] == 200 and not is_empty(r["json"])
         say("  [PowerMax] GET %-70s (%s, id=%s) -> %s%s"
-            % (path, label, _id, short(r), ", has data - stopping here" if has_data else ""))
+            % (build_path(r["version_used"] or r["versions_tried"][0]), label, _id, short(r),
+               ", has data - stopping here" if has_data else ""))
         last = (_id, r)
         if has_data:
             return last
@@ -245,9 +281,10 @@ def all_working(opener, base, creds, res, ids, path_fn, label, cap=MAX_DEPENDENT
     than `cap` ids exist."""
     out = []
     for _id in ids[:cap]:
-        path = path_fn(_id)
-        r = pmax_call(opener, base, creds, res, path, label="%s (id=%s)" % (label, _id))
-        say("  [PowerMax] GET %-70s (%s, id=%s) -> %s" % (path, label, _id, short(r)))
+        build_path = path_fn(_id)
+        r = versioned_call(opener, base, creds, res, build_path, label="%s (id=%s)" % (label, _id))
+        say("  [PowerMax] GET %-70s (%s, id=%s) -> %s"
+            % (build_path(r["version_used"] or r["versions_tried"][0]), label, _id, short(r)))
         out.append((_id, r))
     return out
 
@@ -266,39 +303,66 @@ def pick_best(results):
 
 # ------------------------------------------- endpoint groups -------------------------------------------
 
+def discover_api_versions(opener, base, creds, res):
+    """GET /version (itself unversioned) to learn which API versions this Unisphere actually supports,
+    newest first, so every later versioned_call() tries the latest first and falls back on failure
+    instead of assuming a single hardcoded version."""
+    r = pmax_call(opener, base, creds, res, "/version", label="API version discovery")
+    versions = None
+    if isinstance(r["json"], dict):
+        raw = r["json"].get("supported_api_versions")
+        if isinstance(raw, list) and raw:
+            try:
+                versions = sorted({str(v) for v in raw}, key=lambda s: int(s), reverse=True)
+            except (TypeError, ValueError):
+                versions = [str(v) for v in raw]
+    if not versions:
+        versions = [API_VERSION]
+        say("  [PowerMax] could not discover supported API versions (%s) - falling back to %s"
+            % (short(r), API_VERSION))
+    else:
+        unisphere_version = r["json"].get("version", "?") if isinstance(r["json"], dict) else "?"
+        say("  [PowerMax] Unisphere %s reports supported API versions: %s" % (unisphere_version, ", ".join(versions)))
+    res["api_versions"] = versions
+    return versions
+
+
 def discover_array_id(opener, base, creds, res):
-    r = pmax_call(opener, base, creds, res, "/%s/sloprovisioning/symmetrix" % API_VERSION, label="symmetrix list")
+    build_path = vpath("/%s/sloprovisioning/symmetrix")
+    r = versioned_call(opener, base, creds, res, build_path, label="symmetrix list")
     ids = list_ids(r["json"], "symmetrixId")
-    say("  [PowerMax] GET /%s/sloprovisioning/symmetrix -> %s, %d array id(s) found" % (API_VERSION, short(r), len(ids)))
+    say("  [PowerMax] GET %s -> %s, %d array id(s) found"
+        % (build_path(r["version_used"] or r["versions_tried"][0]), short(r), len(ids)))
     if not ids:
         return None
     picked = first_working(
         opener, base, creds, res, ids,
-        lambda aid: "/%s/system/symmetrix/%s/health" % (API_VERSION, aid),
+        lambda aid: vpath("/%s/system/symmetrix/%s/health", aid),
         "array health (validating array id)")
     return picked[0] if picked else ids[0]
 
 
 def health_hardware(opener, base, creds, res, array_id):
     say("  -- Health & Hardware --")
-    pmax_call(opener, base, creds, res, "/%s/system/symmetrix/%s/health" % (API_VERSION, array_id), label="array health")
+    versioned_call(opener, base, creds, res, vpath("/%s/system/symmetrix/%s/health", array_id), label="array health")
 
-    r = pmax_call(
+    r = versioned_call(
         opener, base, creds, res,
-        "/%s/system/symmetrix/%s/health/health_check" % (API_VERSION, array_id), label="health check list")
+        vpath("/%s/system/symmetrix/%s/health/health_check", array_id), label="health check list")
     health_check_ids = list_ids(r["json"], "health_check_id")
     say("  [PowerMax] %d health check id(s) found" % len(health_check_ids))
     all_working(
         opener, base, creds, res, health_check_ids,
-        lambda h: "/%s/system/symmetrix/%s/health/health_check/%s" % (API_VERSION, array_id, h),
+        lambda h: vpath("/%s/system/symmetrix/%s/health/health_check/%s", array_id, h),
         "health check detail")
 
-    r = pmax_call(opener, base, creds, res, "/%s/system/symmetrix/%s/director" % (API_VERSION, array_id), label="director list")
+    r = versioned_call(
+        opener, base, creds, res, vpath("/%s/system/symmetrix/%s/director", array_id), label="director list")
     dir_ids = list_ids(r["json"], "directorId")
     say("  [PowerMax] %d director id(s) found" % len(dir_ids))
     dir_results = all_working(
         opener, base, creds, res, dir_ids,
-        lambda d: "/%s/system/symmetrix/%s/director/%s" % (API_VERSION, array_id, d),
+        lambda d: vpath("/%s/system/symmetrix/%s/director/%s", array_id, d),
         "director detail")
     dir_id = pick_best(dir_results)
 
@@ -306,60 +370,60 @@ def health_hardware(opener, base, creds, res, array_id):
         say("  [PowerMax] no director id available - skipping port detail calls")
         return
 
-    r = pmax_call(
+    r = versioned_call(
         opener, base, creds, res,
-        "/%s/system/symmetrix/%s/director/%s/port" % (API_VERSION, array_id, dir_id), label="director port list")
+        vpath("/%s/system/symmetrix/%s/director/%s/port", array_id, dir_id), label="director port list")
     port_ids = list_ids(r["json"], "symmetrixPortKey", item_id_keys=["portId"])
     say("  [PowerMax] %d port id(s) found on director %s" % (len(port_ids), dir_id))
     all_working(
         opener, base, creds, res, port_ids,
-        lambda p: "/%s/system/symmetrix/%s/director/%s/port/%s" % (API_VERSION, array_id, dir_id, p),
+        lambda p: vpath("/%s/system/symmetrix/%s/director/%s/port/%s", array_id, dir_id, p),
         "director port detail")
 
 
 def capacity_planning(opener, base, creds, res, array_id):
     say("  -- Capacity Planning --")
-    pmax_call(
+    versioned_call(
         opener, base, creds, res,
-        "/%s/sloprovisioning/symmetrix/%s" % (API_VERSION, array_id), label="symmetrix (array) detail")
+        vpath("/%s/sloprovisioning/symmetrix/%s", array_id), label="symmetrix (array) detail")
 
-    r = pmax_call(
+    r = versioned_call(
         opener, base, creds, res,
-        "/%s/sloprovisioning/symmetrix/%s/srp" % (API_VERSION, array_id), label="srp list")
+        vpath("/%s/sloprovisioning/symmetrix/%s/srp", array_id), label="srp list")
     srp_ids = list_ids(r["json"], "srpId")
     say("  [PowerMax] %d SRP id(s) found" % len(srp_ids))
     all_working(
         opener, base, creds, res, srp_ids,
-        lambda s: "/%s/sloprovisioning/symmetrix/%s/srp/%s" % (API_VERSION, array_id, s), "SRP detail")
+        lambda s: vpath("/%s/sloprovisioning/symmetrix/%s/srp/%s", array_id, s), "SRP detail")
 
-    r = pmax_call(
+    r = versioned_call(
         opener, base, creds, res,
-        "/%s/sloprovisioning/symmetrix/%s/storagegroup" % (API_VERSION, array_id), label="storage group list")
+        vpath("/%s/sloprovisioning/symmetrix/%s/storagegroup", array_id), label="storage group list")
     sg_ids = list_ids(r["json"], "storageGroupId")
     say("  [PowerMax] %d storage group id(s) found" % len(sg_ids))
     sg_results = all_working(
         opener, base, creds, res, sg_ids,
-        lambda s: "/%s/sloprovisioning/symmetrix/%s/storagegroup/%s" % (API_VERSION, array_id, s),
+        lambda s: vpath("/%s/sloprovisioning/symmetrix/%s/storagegroup/%s", array_id, s),
         "storage group detail")
     res["sg_id"] = pick_best(sg_results)
 
-    r = pmax_call(
+    r = versioned_call(
         opener, base, creds, res,
-        "/%s/sloprovisioning/symmetrix/%s/volume" % (API_VERSION, array_id), label="volume list")
+        vpath("/%s/sloprovisioning/symmetrix/%s/volume", array_id), label="volume list")
     volume_ids = list_ids(r["json"], nested_path=("resultList", "result"), item_id_keys=["volumeId"])
     say("  [PowerMax] %d volume id(s) found" % len(volume_ids))
     all_working(
         opener, base, creds, res, volume_ids,
-        lambda v: "/%s/sloprovisioning/symmetrix/%s/volume/%s" % (API_VERSION, array_id, v), "volume detail")
+        lambda v: vpath("/%s/sloprovisioning/symmetrix/%s/volume/%s", array_id, v), "volume detail")
 
-    r = pmax_call(
+    r = versioned_call(
         opener, base, creds, res,
-        "/%s/system/symmetrix/%s/disk" % (API_VERSION, array_id), label="disk list")
+        vpath("/%s/system/symmetrix/%s/disk", array_id), label="disk list")
     disk_ids = list_ids(r["json"], "disk_ids")
     say("  [PowerMax] %d disk id(s) found" % len(disk_ids))
     all_working(
         opener, base, creds, res, disk_ids,
-        lambda d: "/%s/system/symmetrix/%s/disk/%s" % (API_VERSION, array_id, d), "disk detail")
+        lambda d: vpath("/%s/system/symmetrix/%s/disk/%s", array_id, d), "disk detail")
 
 
 def performance(opener, base, creds, res, array_id):
@@ -425,31 +489,31 @@ def performance(opener, base, creds, res, array_id):
 
 def alerts(opener, base, creds, res, array_id):
     say("  -- Alerts --")
-    pmax_call(opener, base, creds, res, "/%s/system/alert_summary" % API_VERSION, label="alert summary")
+    versioned_call(opener, base, creds, res, vpath("/%s/system/alert_summary"), label="alert summary")
 
-    r = pmax_call(
+    r = versioned_call(
         opener, base, creds, res,
-        "/%s/system/alert?array=%s" % (API_VERSION, array_id), label="alert list (unfiltered)")
+        vpath("/%s/system/alert?array=%s", array_id), label="alert list (unfiltered)")
     alert_ids = list_ids(r["json"], "alertId")
     say("  [PowerMax] %d alert id(s) found" % len(alert_ids))
     all_working(
         opener, base, creds, res, alert_ids,
-        lambda a: "/%s/system/alert/%s" % (API_VERSION, a), "alert detail", cap=MAX_RECORDS)
+        lambda a: vpath("/%s/system/alert/%s", a), "alert detail", cap=MAX_RECORDS)
 
 
 def audit_logs(opener, base, creds, res, array_id):
     say("  -- Audit Logs --")
     now_s = int(time.time())
     start_s = now_s - 7 * 24 * 3600  # 7-day lookback to maximize the chance of finding real records
-    r = pmax_call(
+    r = versioned_call(
         opener, base, creds, res,
-        "/%s/system/symmetrix/%s/audit_log_record?entry_date=>%d&entry_date=<%d" % (API_VERSION, array_id, start_s, now_s),
+        vpath("/%s/system/symmetrix/%s/audit_log_record?entry_date=>%d&entry_date=<%d", array_id, start_s, now_s),
         label="audit log list (last 7 days)")
     record_ids = list_ids(r["json"], "record_id")
     say("  [PowerMax] %d audit log record id(s) found" % len(record_ids))
     all_working(
         opener, base, creds, res, record_ids,
-        lambda rid: "/%s/system/symmetrix/%s/audit_log_record/%s" % (API_VERSION, array_id, rid),
+        lambda rid: vpath("/%s/system/symmetrix/%s/audit_log_record/%s", array_id, rid),
         "audit log record detail", cap=MAX_RECORDS)
 
 
@@ -457,40 +521,44 @@ def data_protection(opener, base, creds, res, array_id):
     say("  -- Data Protection / Disaster Recovery --")
     sg_id = res.get("sg_id")
     if sg_id:
-        r = pmax_call(
+        r = versioned_call(
             opener, base, creds, res,
-            "/%s/replication/symmetrix/%s/storagegroup/%s/snapshot" % (API_VERSION, array_id, sg_id),
+            vpath("/%s/replication/symmetrix/%s/storagegroup/%s/snapshot", array_id, sg_id),
             label="storage group snapshot list")
         snap_names = list_ids(r["json"], "name")
         say("  [PowerMax] %d snapshot name(s) found for storage group %s" % (len(snap_names), sg_id))
         all_working(
             opener, base, creds, res, snap_names,
-            lambda n: "/%s/replication/symmetrix/%s/storagegroup/%s/snapshot/%s/snapid"
-                     % (API_VERSION, array_id, sg_id, n),
+            lambda n: vpath("/%s/replication/symmetrix/%s/storagegroup/%s/snapshot/%s/snapid",
+                            array_id, sg_id, n),
             "snapshot snapid detail")
     else:
         say("  [PowerMax] no storage group id available - skipping snapshot calls")
 
-    r = pmax_call(
+    r = versioned_call(
         opener, base, creds, res,
-        "/%s/replication/symmetrix/%s/rdf_group" % (API_VERSION, array_id), label="rdf group list")
+        vpath("/%s/replication/symmetrix/%s/rdf_group", array_id), label="rdf group list")
     rdfg_ids = list_ids(r["json"], "rdfGroupID", item_id_keys=["rdfgNumber", "rdfGroupNumber", "number"])
     say("  [PowerMax] %d RDF group id(s) found" % len(rdfg_ids))
     all_working(
         opener, base, creds, res, rdfg_ids,
-        lambda g: "/%s/replication/symmetrix/%s/rdf_group/%s" % (API_VERSION, array_id, g), "rdf group detail")
+        lambda g: vpath("/%s/replication/symmetrix/%s/rdf_group/%s", array_id, g), "rdf group detail")
 
 
 # ------------------------------------------------- run -------------------------------------------------
 
 def new_result():
-    return {"array_id": None, "sg_id": None, "endpoints_total": 0, "endpoints_failed": []}
+    return {"array_id": None, "sg_id": None, "api_versions": None, "endpoints_total": 0, "endpoints_failed": []}
 
 
 def check_port(opener, port, creds, results):
-    base = "%s://%s:%d" % (SCHEME, host_name(), int(port))
+    # Unisphere's REST app is mounted under /univmax/restapi - every path in the official doc
+    # (e.g. /103/sloprovisioning/symmetrix) is relative to that, not to the bare host:port.
+    base = "%s://%s:%d/univmax/restapi" % (SCHEME, host_name(), int(port))
     say("\n=== %s ===" % base)
     res = results[port] = new_result()
+
+    safe("discover api versions", discover_api_versions, opener, base, creds, res)
 
     array_id = safe("discover array id", discover_array_id, opener, base, creds, res)
     if not array_id:
